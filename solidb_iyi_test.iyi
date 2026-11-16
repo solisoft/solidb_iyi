@@ -1,0 +1,169 @@
+# The driver against a running server. Without SOLIDB_TEST_PORT there is
+# none to talk to and the test passes having checked nothing; `run_tests.sh`
+# starts a throwaway server and sets it.
+#
+#   SOLIDB_TEST_PORT=6745 SOLIDB_TEST_PASSWORD=secret iyi test
+
+module solidb_iyi_test
+
+import solidb_iyi::{Client, Fields, SolidbError, ErrorKind}
+import std/json::{Any, JSON}
+
+if Program.env("SOLIDB_TEST_PORT").nil?
+  puts "SOLIDB_TEST_PORT is not set: no server, nothing checked"
+  exit 0
+end
+PORT     = (Program.env("SOLIDB_TEST_PORT") || "6745").to_i
+PASSWORD = Program.env("SOLIDB_TEST_PASSWORD") || "admin"
+DB       = "iyi_driver_test"
+
+def client : Client
+  db = Client.new("127.0.0.1", PORT)
+  db.auth("_system", "admin", PASSWORD).or_panic
+  db
+end
+
+# The reason a call was refused with, or "" when it was not.
+def refusal(result) : String
+  result.is_a?(SolidbError) ? result.message : ""
+end
+
+setup = client
+setup.delete_database(DB)
+setup.create_database(DB).or_panic
+setup.create_collection(DB, "users").or_panic
+
+test "ping answers the server's clock" do
+  assert client.ping.or_panic > 1_600_000_000_000_i64
+end
+
+test "a server that is not there is a connection error" do
+  nowhere = Client.new("127.0.0.1", 1)
+  result = nowhere.ping
+  assert result.is_a?(SolidbError)
+  assert_eq ErrorKind::Connection, result.kind if result.is_a?(SolidbError)
+  assert !nowhere.connected?
+end
+
+test "a wrong password is refused, and so is what follows" do
+  db = Client.new("127.0.0.1", PORT)
+  assert_ne "", refusal(db.auth("_system", "admin", PASSWORD + "x"))
+  assert_ne "", refusal(db.list_databases)
+end
+
+test "databases and collections" do
+  db = client
+  assert_includes db.list_databases.or_panic.as_a, Any.new(DB)
+  db.create_collection(DB, "edges", "edge").or_panic
+  names = db.list_collections(DB).or_panic.as_a.map { |c| c.as_s? || c["name"].as_s }
+  assert_includes names, "users"
+  assert_includes names, "edges"
+  db.delete_collection(DB, "edges").or_panic
+  assert !db.collection_stats(DB, "users").or_panic.as_h?.nil?
+end
+
+test "a document is inserted, read, updated and deleted" do
+  db = client
+  stored = db.insert(DB, "users", JSON.parse(%({"name":"Ada","age":36,"score":9.5,"tags":["a","é"],"none":null})), "ada").or_panic
+  assert_eq "ada", stored["_key"].as_s
+  assert stored["_id"].as_s.ends_with?("users/ada")
+
+  read = db.get(DB, "users", "ada").or_panic
+  assert_eq "Ada", read["name"].as_s
+  assert_eq 36_i64, read["age"].as_i64
+  assert_eq 9.5, read["score"].as_f
+  assert_eq "é", read["tags"][1].as_s
+  assert_eq Any.new(nil), read["none"]
+
+  db.update(DB, "users", "ada", JSON.parse(%({"age":37}))).or_panic
+  merged = db.get(DB, "users", "ada").or_panic
+  assert_eq 37_i64, merged["age"].as_i64
+  assert_eq "Ada", merged["name"].as_s
+
+  replaced = db.update(DB, "users", "ada", JSON.parse(%({"age":38})), merge: false).or_panic
+  assert_eq 38_i64, replaced["age"].as_i64
+
+  generated = db.insert(DB, "users", JSON.parse(%({"name":"Bob"}))).or_panic
+  assert generated["_key"].as_s.bytesize > 0
+
+  db.delete(DB, "users", "ada").or_panic
+  assert_ne "", refusal(db.get(DB, "users", "ada"))
+  # The connection is still good after a refusal.
+  assert db.ping.or_panic > 0_i64
+end
+
+test "bulk insert, list, and queries with bind variables" do
+  db = client
+  db.create_collection(DB, "items").or_panic
+  documents = (1..500).map { |n| JSON.parse(%({"n":#{n},"label":"item #{n}","big":#{n.to_i64 * 10_000_000_000_i64},"neg":#{-n}})) }
+  assert_eq 500_i64, db.bulk_insert(DB, "items", documents).or_panic
+  assert_eq 20, db.list(DB, "items", 20, 0).or_panic.size
+
+  rows = db.query(DB, "FOR i IN items FILTER i.n > @low AND i.n <= @high SORT i.n RETURN {n: i.n, big: i.big, neg: i.neg}", JSON.parse(%({"low":10,"high":13}))).or_panic.as_a
+  assert_eq 3, rows.size
+  assert_eq 11_i64, rows[0]["n"].as_i64
+  assert_eq 110_000_000_000_i64, rows[0]["big"].as_i64
+  assert_eq -11_i64, rows[0]["neg"].as_i64
+
+  # A reply of several hundred rows, read whole, with the cache off.
+  all = db.query(DB, "FOR i IN items RETURN i", cache: false).or_panic.as_a
+  assert_eq 500, all.size
+  assert_eq 500, db.query(DB, "RETURN COLLECTION_COUNT(\"items\")").or_panic[0].as_i
+
+  assert_ne "", refusal(db.query(DB, "FOR i IN RETURN"))
+  assert !db.explain(DB, "FOR i IN items FILTER i.n == 1 RETURN i").or_panic.as_h?.nil?
+end
+
+test "indexes" do
+  db = client
+  db.create_index(DB, "items", "by_n", ["n"], unique: true).or_panic
+  names = db.list_indexes(DB, "items").or_panic.as_a.map { |i| i["name"].as_s }
+  assert_includes names, "by_n"
+  assert_ne "", refusal(db.insert(DB, "items", JSON.parse(%({"n":1}))))
+  db.delete_index(DB, "items", "by_n").or_panic
+  db.insert(DB, "items", JSON.parse(%({"n":1}))).or_panic
+end
+
+test "a transaction stages its writes until it commits" do
+  db = client
+  other = client
+  db.create_collection(DB, "accounts").or_panic
+
+  id = db.begin_transaction(DB).or_panic
+  assert id.bytesize > 0
+  assert db.in_transaction?
+  db.insert(DB, "accounts", JSON.parse(%({"balance":100})), "a").or_panic
+  assert_ne "", refusal(other.get(DB, "accounts", "a"))
+  assert_includes refusal(db.begin_transaction(DB)), "already open"
+  assert_includes refusal(db.bulk_insert(DB, "accounts", [] of Any)), "cannot run inside a transaction"
+  db.commit_transaction.or_panic
+  assert !db.in_transaction?
+  assert_eq 100_i64, other.get(DB, "accounts", "a").or_panic["balance"].as_i64
+
+  db.begin_transaction(DB, "serializable").or_panic
+  db.update(DB, "accounts", "a", JSON.parse(%({"balance":0}))).or_panic
+  db.insert(DB, "accounts", JSON.parse(%({"balance":1})), "b").or_panic
+  db.rollback_transaction.or_panic
+  assert_eq 100_i64, db.get(DB, "accounts", "a").or_panic["balance"].as_i64
+  assert_ne "", refusal(db.get(DB, "accounts", "b"))
+
+  assert_includes refusal(db.commit_transaction), "no transaction is open"
+end
+
+test "a command without a method goes through request" do
+  db = client
+  db.request(Fields.new("truncate_collection").set("database", DB).set("collection", "items")).or_panic
+  assert_eq 0, db.query(DB, "FOR i IN items RETURN 1", cache: false).or_panic.size
+end
+
+test "a closed client connects again at its next call" do
+  db = client
+  db.close
+  assert !db.connected?
+  # A new connection is not logged in.
+  assert_ne "", refusal(db.list_databases)
+  db.auth("_system", "admin", PASSWORD).or_panic
+  assert_includes db.list_databases.or_panic.as_a, Any.new(DB)
+end
+
+setup.delete_database(DB).or_panic

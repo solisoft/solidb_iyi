@@ -1,0 +1,433 @@
+# The SoliDB native driver: one TCP connection speaking the server's binary
+# protocol, `solidb-drv-v1`.
+#
+# A connection opens with the 14 bytes `solidb-drv-v1\0`. From then on each
+# side sends frames: a length of four bytes, big-endian, then that many
+# bytes of MessagePack. A request is a map that opens with `cmd`; a reply is
+# a map with a `status` of `ok`, `error` or `pong`.
+#
+#     # iyi get github.com/solisoft/solidb_iyi --as solidb
+#     import solidb::{Client}
+#     import std/json::{JSON}
+#
+#     db = Client.new("127.0.0.1", 6745)
+#     db.auth("_system", "admin", "secret").or_panic
+#     db.insert("shop", "users", JSON.parse(%({"name": "Ada"}))).or_panic
+#     rows = db.query("shop", "FOR u IN users RETURN u.name").or_panic
+#
+# Values are `std/json`'s `Any`. Every call answers its value or a
+# `SolidbError`, which is an ordinary member of the return type: `!`
+# passes it on, `.or_panic` stops on it, a `case` handles it.
+#
+# A `Client` is one connection and one conversation: a task that shares one
+# with another must not call it while the other waits for a reply. Give
+# each task its own.
+
+module solidb_iyi
+
+import solidb_iyi/msgpack::{Packer, unpack, MsgpackError}
+import std/json::{Any}
+import std/slice::{Bytes}
+import std/socket::{IyiSocket, SocketError}
+
+# What opens a connection, before the first frame.
+MAGIC = "solidb-drv-v1\0"
+
+# The largest frame either side sends, the server's own limit.
+pub MAX_MESSAGE_SIZE = 16 * 1024 * 1024
+
+# Why a call did not answer.
+pub enum ErrorKind
+  # The connection could not be made, or was lost: the client reconnects
+  # at the next call.
+  Connection
+  # The server sent what this driver does not read.
+  Protocol
+  # The server refused the request; `message` is its reason.
+  Server
+  # A transaction call that does not fit the client's state.
+  Transaction
+end
+
+pub struct SolidbError
+  getter kind : ErrorKind
+  getter reason : String
+
+  def initialize(@kind : ErrorKind, @reason : String)
+  end
+end
+
+impl Error for SolidbError
+  def message : String
+    reason
+  end
+end
+
+# The fields of a request, in the order they are sent.
+pub class Fields
+  getter entries : Hash(String, Any)
+
+  def initialize(command : String)
+    @entries = {"cmd" => Any.new(command)}
+  end
+
+  def set(name : String, value : Any) : Fields
+    @entries[name] = value
+    self
+  end
+
+  def set(name : String, value : String) : Fields
+    set(name, Any.new(value))
+  end
+
+  def set(name : String, value : Bool) : Fields
+    set(name, Any.new(value))
+  end
+
+  def set(name : String, value : Int32) : Fields
+    set(name, Any.new(value.to_i64))
+  end
+
+  def set(name : String, value : Array(String)) : Fields
+    set(name, Any.new(value.map { |item| Any.new(item) }))
+  end
+
+  def to_any : Any
+    Any.new(@entries)
+  end
+end
+
+pub class Client
+  getter host : String
+  getter port : Int32
+
+  # How long a connect may take, and how long a reply may be waited for,
+  # in milliseconds; -1 and nil wait for ever.
+  property connect_timeout_ms : Int32
+  property read_timeout_ms : Int32 | Nil
+
+  def initialize(@host : String = "127.0.0.1", @port : Int32 = 6745)
+    @socket = nil.as(IyiSocket | Nil)
+    @connect_timeout_ms = -1
+    @read_timeout_ms = nil.as(Int32 | Nil)
+    @transaction = nil.as(String | Nil)
+  end
+
+  def connected? : Bool
+    !@socket.nil?
+  end
+
+  # Opens the connection. Every call does it when there is none, so this
+  # is only to learn at once that the server is not there.
+  def connect : Nil | SolidbError
+    return nil unless @socket.nil?
+    socket = case IyiSocket.connect(@host, @port, @connect_timeout_ms)
+             in IyiSocket   then it
+             in Cancelled   then return lost("connecting to #{@host}:#{@port} was cancelled")
+             in SocketError then return lost("cannot connect to #{@host}:#{@port}: #{it.message}")
+             end
+    socket.nodelay = true
+    socket.read_timeout_ms = @read_timeout_ms
+    @socket = socket
+    write(socket, Bytes.of(MAGIC))!
+    nil
+  end
+
+  # Closes the connection. A transaction left open on it is rolled back
+  # by the server.
+  def close : Nil
+    socket = @socket
+    socket.close unless socket.nil?
+    @socket = nil
+    @transaction = nil
+  end
+
+  # --- The server ---
+
+  # The server's clock, in milliseconds since 1970.
+  def ping : Int64 | SolidbError
+    reply = request(Fields.new("ping"))!
+    reply.as_i64? || 0_i64
+  end
+
+  # Logs this connection in. *database* is the one the user belongs to:
+  # `_system` for an administrator.
+  def auth(database : String, username : String, password : String) : Nil | SolidbError
+    request(Fields.new("auth").set("database", database).set("username", username).set("password", password))!
+    nil
+  end
+
+  def auth_with_api_key(database : String, api_key : String) : Nil | SolidbError
+    request(Fields.new("auth").set("database", database).set("username", "").set("password", "").set("api_key", api_key))!
+    nil
+  end
+
+  # --- Databases and collections ---
+
+  def list_databases : Any | SolidbError
+    request(Fields.new("list_databases"))
+  end
+
+  def create_database(name : String) : Nil | SolidbError
+    request(Fields.new("create_database").set("name", name))!
+    nil
+  end
+
+  def delete_database(name : String) : Nil | SolidbError
+    request(Fields.new("delete_database").set("name", name))!
+    nil
+  end
+
+  def list_collections(database : String) : Any | SolidbError
+    request(Fields.new("list_collections").set("database", database))
+  end
+
+  # *type* is `document` (the server's default when nil), `edge`,
+  # `timeseries` or `blob`.
+  def create_collection(database : String, name : String, type : String | Nil = nil) : Nil | SolidbError
+    fields = Fields.new("create_collection").set("database", database).set("name", name)
+    fields.set("type", type) unless type.nil?
+    request(fields)!
+    nil
+  end
+
+  def delete_collection(database : String, name : String) : Nil | SolidbError
+    request(Fields.new("delete_collection").set("database", database).set("name", name))!
+    nil
+  end
+
+  def collection_stats(database : String, name : String) : Any | SolidbError
+    request(Fields.new("collection_stats").set("database", database).set("name", name))
+  end
+
+  # --- Documents ---
+
+  # The stored document, with its `_key`, `_id` and `_rev`. Without *key*
+  # the server makes one.
+  def insert(database : String, collection : String, document : Any, key : String | Nil = nil) : Any | SolidbError
+    fields = Fields.new("insert").set("database", database).set("collection", collection)
+    fields.set("key", key) unless key.nil?
+    request(fields.set("document", document))
+  end
+
+  # Inserts *documents* in one request and answers how many were stored.
+  # Not inside a transaction: the server cannot stage it.
+  def bulk_insert(database : String, collection : String, documents : Array(Any)) : Int64 | SolidbError
+    reply = request(Fields.new("bulk_insert").set("database", database).set("collection", collection).set("documents", Any.new(documents)))!
+    reply.as_i64? || documents.size.to_i64
+  end
+
+  # The document, or a `Server` error when there is none under *key*.
+  def get(database : String, collection : String, key : String) : Any | SolidbError
+    request(Fields.new("get").set("database", database).set("collection", collection).set("key", key))
+  end
+
+  # The document as it is stored afterwards. *merge* is sent as it is
+  # given; the server lays the fields of *document* over the stored ones
+  # either way (observed on 2.11.0).
+  def update(database : String, collection : String, key : String, document : Any, merge : Bool = true) : Any | SolidbError
+    request(Fields.new("update").set("database", database).set("collection", collection).set("key", key).set("document", document).set("merge", merge))
+  end
+
+  def delete(database : String, collection : String, key : String) : Nil | SolidbError
+    request(Fields.new("delete").set("database", database).set("collection", collection).set("key", key))!
+    nil
+  end
+
+  def list(database : String, collection : String, limit : Int32 = 50, offset : Int32 = 0) : Any | SolidbError
+    request(Fields.new("list").set("database", database).set("collection", collection).set("limit", limit).set("offset", offset))
+  end
+
+  # --- Queries ---
+
+  # The rows of an SDBQL query. *bind_vars* is a map of the query's
+  # `@names` to their values. With *cache* off the server runs the query
+  # even when it holds its result.
+  def query(database : String, sdbql : String, bind_vars : Any | Nil = nil, cache : Bool = true) : Any | SolidbError
+    fields = Fields.new("query").set("database", database).set("sdbql", sdbql)
+    fields.set("bind_vars", bind_vars) unless bind_vars.nil?
+    fields.set("cache", false) unless cache
+    request(fields)
+  end
+
+  def explain(database : String, sdbql : String, bind_vars : Any | Nil = nil) : Any | SolidbError
+    fields = Fields.new("explain").set("database", database).set("sdbql", sdbql)
+    fields.set("bind_vars", bind_vars) unless bind_vars.nil?
+    request(fields)
+  end
+
+  # --- Indexes ---
+
+  def create_index(database : String, collection : String, name : String, fields : Array(String), unique : Bool = false, sparse : Bool = false) : Nil | SolidbError
+    request(Fields.new("create_index").set("database", database).set("collection", collection).set("name", name).set("fields", fields).set("unique", unique).set("sparse", sparse))!
+    nil
+  end
+
+  def list_indexes(database : String, collection : String) : Any | SolidbError
+    request(Fields.new("list_indexes").set("database", database).set("collection", collection))
+  end
+
+  def delete_index(database : String, collection : String, name : String) : Nil | SolidbError
+    request(Fields.new("delete_index").set("database", database).set("collection", collection).set("name", name))!
+    nil
+  end
+
+  # --- Transactions ---
+
+  # Opens a transaction on this connection and answers its id. Until it is
+  # committed or rolled back, `insert`, `update`, `delete` and `query` are
+  # part of it: writes are staged and applied at commit. `get` and `list`
+  # read committed data. *isolation_level* is `read_committed`,
+  # `repeatable_read` or `serializable`.
+  def begin_transaction(database : String, isolation_level : String = "read_committed") : String | SolidbError
+    return SolidbError.new(ErrorKind::Transaction, "a transaction is already open on this client: commit or roll it back first") unless @transaction.nil?
+    reply = request(Fields.new("begin_transaction").set("database", database).set("isolation_level", isolation_level))!
+    id = reply.as_s?
+    return SolidbError.new(ErrorKind::Protocol, "begin_transaction: no transaction id in the reply") if id.nil?
+    @transaction = id
+    id
+  end
+
+  def in_transaction? : Bool
+    !@transaction.nil?
+  end
+
+  # Applies what the open transaction staged. Whatever the answer, the
+  # client has no open transaction afterwards.
+  def commit_transaction : Nil | SolidbError
+    end_transaction("commit_transaction")
+  end
+
+  # Drops what the open transaction staged.
+  def rollback_transaction : Nil | SolidbError
+    end_transaction("rollback_transaction")
+  end
+
+  private def end_transaction(command : String) : Nil | SolidbError
+    id = @transaction
+    return SolidbError.new(ErrorKind::Transaction, "no transaction is open on this client") if id.nil?
+    @transaction = nil
+    exchange(Fields.new(command).set("tx_id", id).to_any)!
+    nil
+  end
+
+  # --- Any other command ---
+
+  # Sends *fields* and answers the reply's data: the server has many more
+  # commands than this class has methods (triggers, scripts, roles, vector
+  # and geo indexes, columnar collections, the cluster), each named in
+  # `src/driver/protocol/command.rs` of the SoliDB repository with its
+  # fields.
+  #
+  #     db.request(Fields.new("truncate_collection").set("database", "shop").set("collection", "logs"))
+  #
+  # nil when the reply carries nothing, a count when it carries only that.
+  def request(fields : Fields) : Any | SolidbError
+    name = fields.entries["cmd"].as_s
+    id = @transaction
+    unless id.nil?
+      if name == "insert" || name == "update" || name == "delete" || name == "query"
+        return exchange(Fields.new("transaction_command").set("tx_id", id).set("command", fields.to_any).to_any)
+      end
+      if name == "bulk_insert" || name == "batch" || name == "begin_transaction"
+        return SolidbError.new(ErrorKind::Transaction, "#{name} cannot run inside a transaction: commit or roll back first")
+      end
+    end
+    exchange(fields.to_any)
+  end
+
+  # --- The wire ---
+
+  private def lost(reason : String) : SolidbError
+    close
+    SolidbError.new(ErrorKind::Connection, reason)
+  end
+
+  private def write(socket : IyiSocket, bytes : Bytes) : Nil | SolidbError
+    sent = 0
+    while sent < bytes.size
+      case socket.write(bytes + sent)
+      in Int32       then sent += it
+      in Cancelled   then return lost("the request was cancelled")
+      in SocketError then return lost("connection lost: #{it.message}")
+      end
+    end
+    nil
+  end
+
+  private def read(socket : IyiSocket, size : Int32) : Bytes | SolidbError
+    bytes = Bytes.new(size)
+    filled = 0
+    while filled < size
+      case socket.read(bytes + filled)
+      in Int32
+        return lost("the server closed the connection") if it == 0
+        filled += it
+      in Cancelled   then return lost("the reply was cancelled")
+      in SocketError then return lost("connection lost: #{it.message}")
+      end
+    end
+    bytes
+  end
+
+  # One request, one reply.
+  private def exchange(command : Any) : Any | SolidbError
+    connect!
+    socket = @socket
+    return lost("not connected") if socket.nil?
+
+    packer = Packer.new
+    # The length is written once the payload's size is known.
+    4.times { packer.byte(0) }
+    packer.value(command)
+    frame = packer.to_bytes
+    size = frame.size - 4
+    return SolidbError.new(ErrorKind::Protocol, "a request of #{size} bytes is more than the server takes (#{MAX_MESSAGE_SIZE})") if size > MAX_MESSAGE_SIZE
+    frame[0] = (size >> 24).to_u8
+    frame[1] = ((size >> 16) & 0xff).to_u8
+    frame[2] = ((size >> 8) & 0xff).to_u8
+    frame[3] = (size & 0xff).to_u8
+    write(socket, frame)!
+
+    header = read(socket, 4)!
+    length = (header[0].to_i64 << 24) | (header[1].to_i64 << 16) | (header[2].to_i64 << 8) | header[3].to_i64
+    # A length that cannot be a frame means the two sides no longer agree
+    # on where frames start: the connection is of no further use.
+    return lost("a reply of #{length} bytes is more than the server sends") if length > MAX_MESSAGE_SIZE.to_i64
+    body = read(socket, length.to_i32)!
+    reply = case unpack(body)
+            in Any          then it
+            in MsgpackError then return lost(it.message)
+            end
+    answer(reply)
+  end
+
+  # What a reply says: its data, the reason it gives, or the little else
+  # it carries.
+  private def answer(reply : Any) : Any | SolidbError
+    status = reply["status"]?
+    return SolidbError.new(ErrorKind::Protocol, "a reply without a status: #{reply.to_json}") if status.nil?
+    case status.as_s?
+    when "error"
+      SolidbError.new(ErrorKind::Server, reason_of(reply["error"]? || Any.new(nil)))
+    when "pong"
+      reply["timestamp"]? || Any.new(nil)
+    else
+      # A begin answers with `tx_id` and no data; a bulk write, a count.
+      reply["data"]? || reply["tx_id"]? || reply["count"]? || reply["responses"]? || Any.new(nil)
+    end
+  end
+
+  # The server's error as text: `"MessageTooLarge"`, or `{Kind: "reason"}`.
+  private def reason_of(error : Any) : String
+    text = error.as_s?
+    return text unless text.nil?
+    map = error.as_h?
+    unless map.nil?
+      map.each do |kind, reason|
+        return reason.as_s? || "#{kind}: #{reason.to_json}"
+      end
+    end
+    error.to_json
+  end
+end

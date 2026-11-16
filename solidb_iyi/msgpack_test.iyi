@@ -1,0 +1,119 @@
+# The codec against bytes written by hand from the MessagePack
+# specification, then every value through pack and unpack.
+
+module solidb_iyi/msgpack_test
+
+import solidb_iyi/msgpack::{pack, unpack, MsgpackError}
+import std/json::{Any, JSON}
+import std/slice::{Bytes}
+
+def hex(any : Any) : String
+  pack(any).hexstring
+end
+
+def digit(byte : UInt8) : Int32
+  byte < 97 ? byte.to_i32 - 48 : byte.to_i32 - 87
+end
+
+def bytes_of(hex : String) : Bytes
+  Bytes.new(hex.bytesize // 2) { |at| (digit(hex.byte_at(at * 2)) * 16 + digit(hex.byte_at(at * 2 + 1))).to_u8 }
+end
+
+def read(hex : String) : Any
+  unpack(bytes_of(hex)).or_panic
+end
+
+test "scalars are written in their shortest form" do
+  assert_eq "c0", hex(Any.new(nil))
+  assert_eq "c2", hex(Any.new(false))
+  assert_eq "c3", hex(Any.new(true))
+  assert_eq "00", hex(Any.new(0_i64))
+  assert_eq "7f", hex(Any.new(127_i64))
+  assert_eq "cc80", hex(Any.new(128_i64))
+  assert_eq "ccff", hex(Any.new(255_i64))
+  assert_eq "cd0100", hex(Any.new(256_i64))
+  assert_eq "cdffff", hex(Any.new(65_535_i64))
+  assert_eq "ce00010000", hex(Any.new(65_536_i64))
+  assert_eq "ceffffffff", hex(Any.new(4_294_967_295_i64))
+  assert_eq "cf0000000100000000", hex(Any.new(4_294_967_296_i64))
+  assert_eq "cf7fffffffffffffff", hex(Any.new(9_223_372_036_854_775_807_i64))
+  assert_eq "ff", hex(Any.new(-1_i64))
+  assert_eq "e0", hex(Any.new(-32_i64))
+  assert_eq "d0df", hex(Any.new(-33_i64))
+  assert_eq "d080", hex(Any.new(-128_i64))
+  assert_eq "d1ff7f", hex(Any.new(-129_i64))
+  assert_eq "d18000", hex(Any.new(-32_768_i64))
+  assert_eq "d2ffff7fff", hex(Any.new(-32_769_i64))
+  assert_eq "d280000000", hex(Any.new(-2_147_483_648_i64))
+  assert_eq "d3ffffffff7fffffff", hex(Any.new(-2_147_483_649_i64))
+  assert_eq "d38000000000000000", hex(Any.new(-9_223_372_036_854_775_807_i64 - 1_i64))
+  assert_eq "cb3ff8000000000000", hex(Any.new(1.5))
+  assert_eq "cbc000000000000000", hex(Any.new(-2.0))
+end
+
+test "strings, arrays and maps" do
+  assert_eq "a0", hex(Any.new(""))
+  assert_eq "a3616263", hex(Any.new("abc"))
+  assert_eq "a2c3a9", hex(Any.new("é"))
+  assert_eq "bf" + "61" * 31, hex(Any.new("a" * 31))
+  assert_eq "d920" + "61" * 32, hex(Any.new("a" * 32))
+  assert_eq "da0100" + "61" * 256, hex(Any.new("a" * 256))
+  assert_eq "db00010000", hex(Any.new("a" * 65_536))[0, 10]
+  assert_eq "93010203", hex(JSON.parse("[1,2,3]"))
+  assert_eq "dc0010" + "00" * 16, hex(JSON.parse("[" + (["0"] * 16).join(",") + "]"))
+  # Entries in the order they were written.
+  assert_eq "82a162a178a16101", hex(JSON.parse(%({"b":"x","a":1})))
+end
+
+test "every form is read" do
+  assert_eq Any.new(nil), read("c0")
+  assert_eq Any.new(true), read("c3")
+  assert_eq Any.new(255_i64), read("ccff")
+  assert_eq Any.new(65_535_i64), read("cdffff")
+  assert_eq Any.new(4_294_967_295_i64), read("ceffffffff")
+  assert_eq Any.new(9_223_372_036_854_775_807_i64), read("cf7fffffffffffffff")
+  assert_eq Any.new(-1_i64), read("ff")
+  assert_eq Any.new(-32_i64), read("e0")
+  assert_eq Any.new(-128_i64), read("d080")
+  assert_eq Any.new(-32_768_i64), read("d18000")
+  assert_eq Any.new(-2_147_483_648_i64), read("d280000000")
+  assert_eq Any.new(-9_223_372_036_854_775_807_i64 - 1_i64), read("d38000000000000000")
+  assert_eq Any.new(-2_i64), read("d3fffffffffffffffe")
+  assert_eq Any.new(7_i64), read("d30000000000000007")
+  # Singles: 1.5, -0.375, the smallest subnormal, infinity.
+  assert_eq Any.new(1.5), read("ca3fc00000")
+  assert_eq Any.new(-0.375), read("cabec00000")
+  assert_eq Any.new(1.401298464324817e-45), read("ca00000001")
+  assert_eq Any.new(1.0 / 0.0), read("ca7f800000")
+  assert_eq Any.new(0.1), read("cb3fb999999999999a")
+  # Binary is read as the string of its bytes.
+  assert_eq Any.new("abc"), read("c403616263")
+  assert_eq Any.new("abc"), read("d903616263")
+  assert_eq JSON.parse(%({"status":"ok","data":[1,{"a":null}]})), read("82a6737461747573a26f6ba46461746192" + "01" + "81a161c0")
+end
+
+test "what is packed is read back" do
+  document = JSON.parse(%({"name":"Ada","age":36,"tags":["a","b"],"nested":{"pi":3.25,"none":null,"yes":true,"big":-123456789012},"long":"#{"x" * 300}"}))
+  assert_eq document, unpack(pack(document)).or_panic
+  many = Any.new((0...70_000).map { |n| Any.new(n.to_i64) })
+  assert_eq many, unpack(pack(many)).or_panic
+end
+
+def refused(hex : String) : String
+  case unpack(bytes_of(hex))
+  in Any          then "read"
+  in MsgpackError then it.message
+  end
+end
+
+test "bytes that are not a value are refused, not read" do
+  assert_includes refused(""), "ends in the middle"
+  assert_includes refused("a3616"), "middle of a string"
+  assert_includes refused("cd01"), "ends in the middle"
+  assert_includes refused("0101"), "1 bytes after the value"
+  assert_includes refused("8101a161"), "key that is not a string"
+  assert_includes refused("d6000000000000"), "does not read"
+  assert_includes refused("dd00ffffff"), "an array of"
+  assert_includes refused("91" * 600 + "c0"), "nested more than"
+  assert_eq "read", refused("91" * 63 + "c0")
+end

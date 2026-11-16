@@ -1,0 +1,351 @@
+# MessagePack, as much of it as SoliDB's native driver speaks: a value is a
+# `std/json` `Any` (nil, a boolean, an integer, a float, a string, an array,
+# a map keyed by strings), so a document is built and read the way a JSON
+# one is.
+#
+# iyi's standard library has no MessagePack module; this one is written
+# against the format's specification and checked byte for byte in
+# `msgpack_test.iyi`.
+
+module solidb_iyi/msgpack
+
+import std/json::{Any}
+import std/slice::{Bytes}
+
+# Bytes that are not a value this module reads: cut short, a type the
+# driver never sends (an extension), a map key that is not a string.
+pub struct MsgpackError
+  getter reason : String
+
+  def initialize(@reason : String)
+  end
+end
+
+impl Error for MsgpackError
+  def message : String
+    "msgpack: #{reason}"
+  end
+end
+
+# Writes values one after another into a growing buffer.
+pub class Packer
+  getter buffer : Array(UInt8)
+
+  def initialize
+    @buffer = [] of UInt8
+  end
+
+  def byte(value : Int32) : Nil
+    @buffer << (value & 0xff).to_u8
+  end
+
+  # *value*'s low *count* bytes, the most significant first.
+  def big_endian(value : UInt64, count : Int32) : Nil
+    shift = (count - 1) * 8
+    while shift >= 0
+      @buffer << ((value >> shift) & 0xff_u64).to_u8
+      shift -= 8
+    end
+  end
+
+  def nil_value : Nil
+    byte(0xc0)
+  end
+
+  def bool(value : Bool) : Nil
+    byte(value ? 0xc3 : 0xc2)
+  end
+
+  # The shortest form that holds *value*, as every MessagePack writer
+  # chooses it: the server's own encoder does, and stored bytes are compared.
+  def int(value : Int64) : Nil
+    if value >= 0
+      if value < 128
+        byte(value.to_i32)
+      elsif value < 256
+        byte(0xcc)
+        byte(value.to_i32)
+      elsif value < 65_536
+        byte(0xcd)
+        big_endian(value.to_u64, 2)
+      elsif value < 4_294_967_296_i64
+        byte(0xce)
+        big_endian(value.to_u64, 4)
+      else
+        byte(0xcf)
+        big_endian(value.to_u64, 8)
+      end
+    elsif value >= -32
+      byte((value + 256).to_i32)
+    elsif value >= -128
+      byte(0xd0)
+      byte((value + 256).to_i32)
+    elsif value >= -32_768
+      byte(0xd1)
+      big_endian((value + 65_536).to_u64, 2)
+    elsif value >= -2_147_483_648_i64
+      byte(0xd2)
+      big_endian((value + 4_294_967_296_i64).to_u64, 4)
+    else
+      byte(0xd3)
+      big_endian(twos_complement(value), 8)
+    end
+  end
+
+  # A negative *value* as the 64 bits that hold it.
+  private def twos_complement(value : Int64) : UInt64
+    # -(value + 1) is 0 or more and fits, where -value does not for the
+    # smallest Int64.
+    ~((-(value + 1)).to_u64)
+  end
+
+  def float(value : Float64) : Nil
+    byte(0xcb)
+    big_endian(IyiFloatText.bits_of(value), 8)
+  end
+
+  def string(value : String) : Nil
+    size = value.bytesize
+    if size < 32
+      byte(0xa0 | size)
+    elsif size < 256
+      byte(0xd9)
+      byte(size)
+    elsif size < 65_536
+      byte(0xda)
+      big_endian(size.to_u64, 2)
+    else
+      byte(0xdb)
+      big_endian(size.to_u64, 4)
+    end
+    at = 0
+    while at < size
+      @buffer << value.byte_at(at)
+      at += 1
+    end
+  end
+
+  def array_header(size : Int32) : Nil
+    if size < 16
+      byte(0x90 | size)
+    elsif size < 65_536
+      byte(0xdc)
+      big_endian(size.to_u64, 2)
+    else
+      byte(0xdd)
+      big_endian(size.to_u64, 4)
+    end
+  end
+
+  def map_header(size : Int32) : Nil
+    if size < 16
+      byte(0x80 | size)
+    elsif size < 65_536
+      byte(0xde)
+      big_endian(size.to_u64, 2)
+    else
+      byte(0xdf)
+      big_endian(size.to_u64, 4)
+    end
+  end
+
+  # A map's entries are written in the order the hash holds them, which is
+  # the order they were put in.
+  def value(any : Any) : Nil
+    raw = any.raw
+    case raw
+    in Nil     then nil_value
+    in Bool    then bool(raw)
+    in Int64   then int(raw)
+    in Float64 then float(raw)
+    in String  then string(raw)
+    in Array(Any)
+      array_header(raw.size)
+      raw.each { |item| value(item) }
+    in Hash(String, Any)
+      map_header(raw.size)
+      raw.each do |key, item|
+        string(key)
+        value(item)
+      end
+    end
+  end
+
+  def to_bytes : Bytes
+    held = @buffer
+    Bytes.new(held.size) { |at| held[at] }
+  end
+end
+
+# *any* as MessagePack.
+pub def pack(any : Any) : Bytes
+  packer = Packer.new
+  packer.value(any)
+  packer.to_bytes
+end
+
+# Reads values one after another out of *bytes*.
+pub class Unpacker
+  # How deep arrays and maps may nest: a frame of a few bytes repeated
+  # must not be able to exhaust the stack. A task's stack is 256 KiB and a
+  # level takes about 2 KiB of it (measured: 90 levels are read in a task,
+  # 120 are not), so 64 leaves the caller more than half.
+  MAX_DEPTH = 64
+
+  getter position : Int32
+
+  def initialize(@bytes : Bytes)
+    @position = 0
+    @depth = 0
+  end
+
+  def finished? : Bool
+    @position >= @bytes.size
+  end
+
+  private def take : UInt8 | MsgpackError
+    return MsgpackError.new("the data ends in the middle of a value") if @position >= @bytes.size
+    byte = @bytes[@position]
+    @position += 1
+    byte
+  end
+
+  private def big_endian(count : Int32) : UInt64 | MsgpackError
+    return MsgpackError.new("the data ends in the middle of a value") if @bytes.size - @position < count
+    value = 0_u64
+    count.times do
+      value = (value << 8) | @bytes[@position].to_u64
+      @position += 1
+    end
+    value
+  end
+
+  private def size_of(count : Int32) : Int32 | MsgpackError
+    size = big_endian(count)!
+    return MsgpackError.new("a length of #{size} is more than this driver reads") if size > 2_147_483_647_u64
+    size.to_i32
+  end
+
+  private def text(size : Int32) : Any | MsgpackError
+    return MsgpackError.new("the data ends in the middle of a string") if @bytes.size - @position < size
+    string = String.new(@bytes[@position, size].to_a)
+    @position += size
+    Any.new(string)
+  end
+
+  private def array(size : Int32) : Any | MsgpackError
+    # Every item takes a byte at least: a length the data cannot hold is
+    # refused before anything is reserved for it.
+    return MsgpackError.new("an array of #{size} items in #{@bytes.size - @position} bytes") if size > @bytes.size - @position
+    items = [] of Any
+    size.times do
+      items << value!
+    end
+    Any.new(items)
+  end
+
+  private def map(size : Int32) : Any | MsgpackError
+    return MsgpackError.new("a map of #{size} entries in #{@bytes.size - @position} bytes") if size > (@bytes.size - @position) // 2
+    entries = {} of String => Any
+    size.times do
+      key = value!
+      name = key.as_s?
+      return MsgpackError.new("a map key that is not a string") if name.nil?
+      entries[name] = value!
+    end
+    Any.new(entries)
+  end
+
+  # The 64 bits of a signed integer of *count* bytes, sign extended.
+  private def signed(count : Int32) : Any | MsgpackError
+    bits = big_endian(count)!
+    width = count * 8
+    if width < 64 && (bits >> (width - 1)) & 1_u64 == 1_u64
+      # Negative: its distance below zero is 2^width - bits.
+      return Any.new(-(((1_u64 << width) - bits).to_i64))
+    end
+    return Any.new(bits.to_i64) if bits <= 9_223_372_036_854_775_807_u64
+    # 64 bits with the top one set: -(~bits) - 1.
+    Any.new(-((~bits).to_i64) - 1_i64)
+  end
+
+  # The bits of the double equal to the single whose 32 bits are *bits*.
+  private def widened(bits : UInt64) : UInt64
+    sign = (bits >> 31) << 63
+    exponent = (bits >> 23) & 0xff_u64
+    fraction = bits & 0x7fffff_u64
+    if exponent == 255_u64
+      # Infinity, or not a number.
+      return sign | (2047_u64 << 52) | (fraction << 29)
+    end
+    if exponent == 0_u64
+      return sign if fraction == 0_u64
+      # A subnormal single is an ordinary double: shift its first set bit
+      # up to where the implicit one stands.
+      shifts = 0_u64
+      while fraction & 0x800000_u64 == 0_u64
+        fraction = fraction << 1
+        shifts += 1_u64
+      end
+      return sign | ((897_u64 - shifts) << 52) | ((fraction & 0x7fffff_u64) << 29)
+    end
+    sign | ((exponent + 896_u64) << 52) | (fraction << 29)
+  end
+
+  # The next value.
+  def value : Any | MsgpackError
+    @depth += 1
+    return MsgpackError.new("values nested more than #{MAX_DEPTH} deep") if @depth > MAX_DEPTH
+    result = read
+    @depth -= 1
+    result
+  end
+
+  private def read : Any | MsgpackError
+    tag = take!.to_i32
+    return Any.new(tag.to_i64) if tag < 0x80
+    return map(tag & 0x0f) if tag < 0x90
+    return array(tag & 0x0f) if tag < 0xa0
+    return text(tag & 0x1f) if tag < 0xc0
+    return Any.new((tag - 256).to_i64) if tag >= 0xe0
+    case tag
+    when 0xc0 then Any.new(nil)
+    when 0xc2 then Any.new(false)
+    when 0xc3 then Any.new(true)
+    when 0xc4 then text(size_of(1)!)
+    when 0xc5 then text(size_of(2)!)
+    when 0xc6 then text(size_of(4)!)
+    when 0xca
+      Any.new(IyiFloatText.from_bits(widened(big_endian(4)!)))
+    when 0xcb
+      Any.new(IyiFloatText.from_bits(big_endian(8)!))
+    when 0xcc, 0xcd, 0xce
+      Any.new(big_endian(1 << (tag - 0xcc))!.to_i64)
+    when 0xcf
+      bits = big_endian(8)!
+      # An integer past Int64's largest is read as the float nearest to it.
+      bits <= 9_223_372_036_854_775_807_u64 ? Any.new(bits.to_i64) : Any.new(bits.to_f64)
+    when 0xd0 then signed(1)
+    when 0xd1 then signed(2)
+    when 0xd2 then signed(4)
+    when 0xd3 then signed(8)
+    when 0xd9 then text(size_of(1)!)
+    when 0xda then text(size_of(2)!)
+    when 0xdb then text(size_of(4)!)
+    when 0xdc then array(size_of(2)!)
+    when 0xdd then array(size_of(4)!)
+    when 0xde then map(size_of(2)!)
+    when 0xdf then map(size_of(4)!)
+    else
+      MsgpackError.new("a value of type 0x#{tag.to_s(16)}, which this driver does not read")
+    end
+  end
+end
+
+# The one value *bytes* holds.
+pub def unpack(bytes : Bytes) : Any | MsgpackError
+  unpacker = Unpacker.new(bytes)
+  any = unpacker.value!
+  return MsgpackError.new("#{bytes.size - unpacker.position} bytes after the value") unless unpacker.finished?
+  any
+end

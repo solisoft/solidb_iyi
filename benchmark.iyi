@@ -1,0 +1,56 @@
+# The other clients' benchmark (`clients/*/benchmark.*`): single inserts
+# under given keys, then a read of each, on one connection; and, past
+# theirs, a query that returns a hundred documents, which is mostly the
+# decoder.
+#
+#   iyi build --release benchmark.iyi -o benchmark_bin
+#   SOLIDB_PORT=6745 SOLIDB_PASSWORD=password ./benchmark_bin
+#
+# BENCH_ITERATIONS (default 1000, the other clients' count) sets how many.
+
+module benchmark
+
+import solidb_iyi::{Client}
+import std/json::{Any}
+import std/time::{Time}
+
+def per_second(count : Int32, started : Float64) : Float64
+  elapsed = Time.monotonic.total_seconds - started
+  (count / elapsed * 100.0).round / 100.0
+end
+
+port = (Program.env("SOLIDB_PORT") || "9998").to_i
+password = Program.env("SOLIDB_PASSWORD") || "password"
+iterations = (Program.env("BENCH_ITERATIONS") || "1000").to_i
+
+db = "bench_db"
+collection = "iyi_bench"
+
+client = Client.new("127.0.0.1", port)
+client.auth("_system", "admin", password).or_panic
+client.create_database(db)
+client.delete_collection(db, collection)
+client.create_collection(db, collection).or_panic
+
+started = Time.monotonic.total_seconds
+iterations.times do |i|
+  document = Any.new({"id" => Any.new(i.to_i64), "data" => Any.new("benchmark data content")})
+  client.insert(db, collection, document, "bench_#{i}").or_panic
+end
+puts "IYI_BENCH_RESULT:#{per_second(iterations, started)}"
+
+started = Time.monotonic.total_seconds
+iterations.times do |i|
+  client.get(db, collection, "bench_#{i}").or_panic
+end
+puts "IYI_READ_BENCH_RESULT:#{per_second(iterations, started)}"
+
+queries = iterations // 10
+started = Time.monotonic.total_seconds
+queries.times do
+  rows = client.query(db, "FOR d IN iyi_bench LIMIT 100 RETURN d", cache: false).or_panic
+  raise "expected 100 rows, got #{rows.size}" unless rows.size == 100 || iterations < 100
+end
+puts "IYI_QUERY_100_BENCH_RESULT:#{per_second(queries, started)}"
+
+client.close
